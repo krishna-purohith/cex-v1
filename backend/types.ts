@@ -14,5 +14,5 @@ export const orderSchema = z.object({
   type: z.enum(["MARKET", "LIMIT"]),
   symbol: z.string(),
   price: z.number().optional(),
-  qty: z.number(),
+  totalBuyQuantity: z.number(),
 });
