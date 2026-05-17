@@ -22,8 +22,8 @@ model User {
 
 model Stocks {
   id     String @id @default(uuid())
-  name   String
-  symbol String
+  name   String 
+  symbol String @unique
 }
 
 model Order {

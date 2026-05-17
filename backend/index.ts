@@ -5,6 +5,8 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { JWT_SECRET } from "./config";
 import { auth } from "./auth";
+import { readBuilderProgram } from "typescript";
+import { success } from "zod";
 
 const app = express();
 app.use(express.json());
@@ -20,7 +22,7 @@ interface Order {
   userId: string;
   qty: number;
   filledQty: number;
-  orderId: number;
+  orderId: string;
   createdAt: Date;
 }
 type Bid = Record<number, { totalQty: number; orders: Order[] }>;
@@ -220,12 +222,13 @@ app.post("/order", auth, async (req, res) => {
       .status(400)
       .json({ success: false, data: null, error: "All fields requried" });
   }
-  const { totalBuyQuantity, side, symbol, type } = validated.data;
+  const { totalQuantity, side, symbol, type, price } = validated.data;
   const userId = req.user!.id;
 
   if (type === "MARKET") {
     if (side === "BUY") {
       // user wants to Buy
+      const totalBuyQuantity = totalQuantity;
       const USDBalance =
         BALANCES[userId]!["USD"]!.total - BALANCES[userId]!["USD"]!.locked;
 
@@ -243,7 +246,7 @@ app.post("/order", auth, async (req, res) => {
       const sortedPrices = prices.sort((a, b) => a - b);
 
       let USDBalanceLeft = USDBalance;
-      let qtyToBeFilled = totalBuyQuantity;
+      let qtyToBeFilled = totalQuantity;
       let totalCostSpent = 0;
 
       // iterate though the sortedPrices n then try to fill the order quantity.
@@ -349,14 +352,393 @@ app.post("/order", auth, async (req, res) => {
         success: true,
         error: null,
         data: {
-          totalBuyQuantity,
+          totalBuyQuantity: totalBuyQuantity,
           totalFilled,
           avgPrice: totalFilled > 0 ? totalCostSpent / totalFilled : 0,
+        },
+      });
+    } else if (side === "SELL") {
+      const totalSellQuantity = totalQuantity;
+      let qtyToBeSold = totalSellQuantity;
+      if (!BALANCES[userId]![symbol]) {
+        return res.status(400).json({
+          success: "false",
+          error: `User doesnot have this assest: ${symbol}`,
+          data: null,
+        });
+      }
+      const userTotalAssetBalance =
+        BALANCES[userId]![symbol]!.total - BALANCES[userId]![symbol]!.locked;
+
+      let totalUSDReceived = 0;
+      if (!ORDER_BOOKS[symbol]?.BIDS) {
+        return res.status(404).json({
+          success: false,
+          data: null,
+          error: "No BIDS available for this asset",
+        });
+      }
+
+      const allBidPricesInString = Object.keys(ORDER_BOOKS[symbol].BIDS);
+      const allBidPrices = allBidPricesInString.map((priceString) =>
+        Number(priceString)
+      );
+
+      const sortedBids = allBidPrices.sort((a, b) => b - a);
+
+      let assetBalanceLeft = userTotalAssetBalance;
+
+      for (const price of sortedBids) {
+        const bidsAvailableAtThisPrice =
+          ORDER_BOOKS[symbol].BIDS[price]!.totalQty;
+        const filled = Math.min(
+          bidsAvailableAtThisPrice,
+          qtyToBeSold,
+          assetBalanceLeft
+        );
+
+        if (filled === 0) break;
+
+        totalUSDReceived += filled * price;
+
+        // udpateSellerBalancesAndDB(filled,)
+        assetBalanceLeft -= filled;
+        BALANCES[userId]![symbol].total -= filled;
+        qtyToBeSold -= filled;
+
+        if (!BALANCES[userId]!["USD"]) {
+          BALANCES[userId]!["USD"] = { locked: 0, total: filled * price };
+        } else {
+          BALANCES[userId]!["USD"].total += filled * price;
+        }
+
+        ORDER_BOOKS[symbol].BIDS[price]!.totalQty -= filled;
+
+        const order = await prisma.order.create({
+          data: {
+            userId,
+            market: symbol,
+            price,
+            qty: totalSellQuantity,
+            type: "MARKET",
+            side: "SELL",
+            filledQty: filled > 0 ? filled : 0,
+            status: "FILLED",
+          },
+        });
+
+        await prisma.fills.create({
+          data: {
+            qty: filled,
+            side: "SELL",
+            type: "MARKET",
+            userId,
+            price,
+            market: symbol,
+            originalOrderId: order.id,
+          },
+        });
+
+        // fulfillBids
+        const orders = ORDER_BOOKS[symbol].BIDS[price]!.orders;
+        let qtyToBeBought = filled;
+
+        for (let i = 0; i < orders.length; i++) {
+          const order = orders[i];
+          if (!order) continue;
+          const pending = order.qty - order.filledQty;
+          const buysFulfilledFromThisOrder = Math.min(pending, qtyToBeBought);
+
+          qtyToBeBought -= buysFulfilledFromThisOrder;
+          order.filledQty += buysFulfilledFromThisOrder;
+
+          BALANCES[order.userId]!["USD"]!.locked -=
+            buysFulfilledFromThisOrder * price;
+          BALANCES[order.userId]!["USD"]!.total -=
+            buysFulfilledFromThisOrder * price;
+
+          if (!BALANCES[order.userId]![symbol]) {
+            BALANCES[order.userId]![symbol] = {
+              locked: 0,
+              total: buysFulfilledFromThisOrder,
+            };
+          } else {
+            BALANCES[order.userId]![symbol]!.total +=
+              buysFulfilledFromThisOrder;
+          }
+
+          if (order.filledQty === order.qty) {
+            orders.splice(i, 1);
+            i--;
+          }
+        }
+
+        if (assetBalanceLeft === 0) break;
+        if (qtyToBeSold === 0) break;
+      }
+
+      const totalSellFills = totalSellQuantity - qtyToBeSold;
+
+      res.status(200).json({
+        success: true,
+        error: null,
+        data: {
+          totalSoldQuantity: totalSellQuantity,
+          totalSellFills: totalSellQuantity - qtyToBeSold,
+          avgPriceOfSell:
+            totalSellFills > 0 ? totalUSDReceived / totalSellFills : 0,
+        },
+      });
+    }
+  } else if (type === "LIMIT") {
+    if (!price) {
+      return res.status(400).json({
+        success: false,
+        data: null,
+        error: "Price msut be included",
+      });
+    }
+    if (side === "BUY") {
+      const totalBidQuantity = totalQuantity;
+      let bidQtyLeft = totalBidQuantity;
+
+      const usdBalance =
+        BALANCES[userId]!["USD"]!.total - BALANCES[userId]!["USD"]!.locked;
+
+      if (usdBalance < price * totalBidQuantity) {
+        return res.status(400).json({
+          success: false,
+          data: null,
+          error: "Not enough USD balance to place the order",
+        });
+      }
+
+      BALANCES[userId]!["USD"]!.locked += totalBidQuantity * price;
+
+      // start matching with ASKs <= Bid price
+      // when there is no opp ASKS for this asset
+      // buy order will sit in the order boook fully.
+      if (!ORDER_BOOKS[symbol]) {
+        ORDER_BOOKS[symbol] = { ASKS: {}, BIDS: {} };
+      }
+
+      if (!ORDER_BOOKS[symbol].ASKS) {
+        const order = await createLimitOrderAndUpdateOrderBook(
+          price,
+          userId,
+          totalBidQuantity,
+          0,
+          symbol,
+          "BUY"
+        );
+
+        return res.status(200).json({
+          success: true,
+          error: null,
+          data: {
+            message: "Order placed",
+            order,
+          },
+        });
+      }
+
+      const askPriceStrings = Object.keys(ORDER_BOOKS[symbol].ASKS);
+      const askPrices = askPriceStrings.map((p) => Number(p));
+      const sortedAskPrices = askPrices.sort((a, b) => a - b);
+
+      let filled = 0;
+
+      for (const askPrice of sortedAskPrices) {
+        // for each askPrice if the askPrice is > bidprice, the remaining quantity will sit in Bids
+        if (askPrice > price) {
+          const order = await createLimitOrderAndUpdateOrderBook(
+            price,
+            userId,
+            totalBidQuantity,
+            filled,
+            symbol,
+            "BUY"
+          );
+
+          return res.status(200).json({
+            success: true,
+            error: null,
+            data: {
+              message: "Limit order placed successfully",
+              filledQty: filled,
+              position: {
+                quantity: totalBidQuantity - filled,
+                orderId: order.id,
+                createdAt: order.createdAt,
+              },
+            },
+          });
+        }
+
+        const orders = ORDER_BOOKS[symbol].ASKS[askPrice]!.orders;
+
+        for (let i = 0; i < orders.length; i++) {
+          const order = orders[i];
+
+          if (!order) continue;
+
+          const pending = order.qty - order.filledQty;
+          const filledFromThisOrder = Math.min(pending, bidQtyLeft);
+
+          ORDER_BOOKS[symbol].ASKS[askPrice]!.totalQty -= filledFromThisOrder;
+          bidQtyLeft -= filledFromThisOrder;
+          filled += filledFromThisOrder;
+          order.filledQty += filledFromThisOrder;
+
+          // fill the bids
+
+          BALANCES[userId]!["USD"]!.locked -= filledFromThisOrder * price;
+          BALANCES[userId]!["USD"]!.total -= filledFromThisOrder * askPrice;
+
+          if (!BALANCES[userId]![symbol]) {
+            BALANCES[userId]![symbol] = {
+              locked: 0,
+              total: filledFromThisOrder,
+            };
+          } else {
+            BALANCES[userId]![symbol].total += filledFromThisOrder;
+          }
+
+          const buyOrder = await prisma.order.create({
+            data: {
+              userId,
+              market: symbol,
+              price: askPrice,
+              qty: totalBidQuantity,
+              type: "LIMIT",
+              side: "BUY",
+              filledQty: filledFromThisOrder,
+              status: "FILLED",
+            },
+          });
+
+          await prisma.fills.create({
+            data: {
+              qty: filledFromThisOrder,
+              side: "BUY",
+              type: "LIMIT",
+              userId,
+              price: askPrice,
+              market: symbol,
+              originalOrderId: buyOrder.id,
+            },
+          });
+
+          BALANCES[order.userId]![symbol]!.locked -= filledFromThisOrder;
+          BALANCES[order.userId]![symbol]!.total -= filledFromThisOrder;
+
+          if (!BALANCES[order.userId]!["USD"]) {
+            BALANCES[order.userId]!["USD"] = {
+              locked: 0,
+              total: askPrice * filledFromThisOrder,
+            };
+          } else {
+            BALANCES[order.userId]!["USD"]!.total +=
+              askPrice * filledFromThisOrder;
+          }
+
+          // delete the price level if the complete order gets filled
+          if (order.filledQty === order.qty) {
+            orders.splice(i, 1);
+            i--;
+          }
+        }
+
+        if (ORDER_BOOKS[symbol].ASKS[askPrice]!.totalQty === 0) {
+          delete ORDER_BOOKS[symbol].ASKS[askPrice];
+        }
+
+        if (bidQtyLeft === 0) break;
+        if (filled === totalBidQuantity) break;
+      }
+
+      if (bidQtyLeft > 0) {
+        const order = await createLimitOrderAndUpdateOrderBook(
+          price,
+          userId,
+          totalBidQuantity,
+          filled,
+          symbol,
+          "BUY"
+        );
+      }
+
+      res.status(200).json({
+        success: true,
+        error: null,
+        data: {
+          message:
+            bidQtyLeft === 0
+              ? "Fully filled"
+              : "Partially filled, remaining resting in book",
+          totalFilled: filled,
+          remaining: bidQtyLeft,
         },
       });
     } else if (side === "SELL") {
     }
   }
 });
+
+async function createLimitOrderAndUpdateOrderBook(
+  price: number,
+  userId: string,
+  totalOrderquantity: number,
+  filled: number,
+  symbol: string,
+  side: "BUY" | "SELL"
+) {
+  const order = await prisma.order.create({
+    data: {
+      userId,
+      market: symbol,
+      price,
+      qty: totalOrderquantity,
+      type: "LIMIT",
+      side,
+      filledQty: filled,
+      status: "OPEN",
+    },
+  });
+
+  if (filled > 0) {
+    await prisma.fills.create({
+      data: {
+        qty: filled,
+        side,
+        type: "LIMIT",
+        userId,
+        price,
+        market: symbol,
+        originalOrderId: order.id,
+      },
+    });
+  }
+
+  // place them in the order books BIDS for this price
+  if (!ORDER_BOOKS[symbol]) {
+    ORDER_BOOKS[symbol] = { ASKS: {}, BIDS: {} };
+  }
+
+  const bookSide = side === "BUY" ? "BIDS" : "ASKS";
+
+  if (!ORDER_BOOKS[symbol][bookSide][price]) {
+    ORDER_BOOKS[symbol][bookSide][price] = { totalQty: 0, orders: [] };
+  }
+  ORDER_BOOKS[symbol][bookSide][price].totalQty += totalOrderquantity - filled;
+  ORDER_BOOKS[symbol][bookSide][price].orders.push({
+    userId,
+    qty: totalOrderquantity,
+    filledQty: filled,
+    orderId: order.id,
+    createdAt: new Date(),
+  });
+  return order;
+}
 
 app.listen(3000, () => console.log(`Backend started on PORT:3000`));
