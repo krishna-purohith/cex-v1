@@ -6,6 +6,7 @@ import jwt from "jsonwebtoken";
 import { JWT_SECRET } from "./config";
 import { auth } from "./auth";
 import { success } from "zod";
+import { Fills } from "./generated/prisma/client";
 
 const app = express();
 app.use(express.json());
@@ -36,6 +37,137 @@ type OrderBook = Record<
 >;
 
 const ORDER_BOOKS: OrderBook = {};
+
+app.get("/depth/:symbol", auth, (req, res) => {});
+
+app.delete("/order/:orderId", auth, async (req, res) => {
+  const id = req.params.orderId;
+  if (typeof id !== "string") {
+    return res.status(400).json({
+      success: false,
+      error: "OrderId should be a string",
+      data: null,
+    });
+  }
+  if (!id) {
+    return res.status(400).json({
+      success: false,
+      error: "OrderId is needed",
+      data: null,
+    });
+  }
+  try {
+    const order = await prisma.order.findUnique({
+      where: { id },
+    });
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        error: "Order not found",
+        data: null,
+      });
+    }
+    if (order.userId !== req.user?.id) {
+      return res.status(400).json({
+        success: false,
+        error: "Forbidden, This order doesnot belong to you",
+        data: null,
+      });
+    }
+
+    if (order.type === "MARKET") {
+      return res.status(200).json({
+        success: false,
+        data: null,
+        error: "You should have a limit order, ",
+      });
+    }
+
+    const side = order.side === "BUY" ? "BIDS" : "ASKS";
+
+    const priceLevel = ORDER_BOOKS[order.market]?[side][order.price]
+    
+
+    const reamainingQty = order.qty - order.filledQty;
+    if (order.side === "BUY") {
+      BALANCES[order.userId]!["USD"]!.locked -= order.price * reamainingQty;
+    } else {
+      BALANCES[order.userId]![order.market]!.locked -= reamainingQty;
+    }
+
+    if (order.status === "OPEN") {
+      await prisma.order.update({
+        where: { id },
+        data: {
+          status: "CANCELLED",
+        },
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: "Order cancelled successfully",
+      error: null,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({
+      success: false,
+      data: null,
+      error: "An error occured",
+    });
+  }
+});
+
+app.get("/order/:orderId", auth, async (req, res) => {
+  const id = req.params.orderId;
+  if (typeof id !== "string") {
+    return res.status(400).json({
+      success: false,
+      error: "OrderId should be a string",
+      data: null,
+    });
+  }
+  if (!id) {
+    return res.status(400).json({
+      success: false,
+      error: "OrderId is needed",
+      data: null,
+    });
+  }
+
+  const order = await prisma.order.findUnique({
+    where: { id },
+  });
+
+  if (order?.userId !== req.user!.id) {
+    return res.status(400).json({
+      success: true,
+      data: null,
+      error: "The orderId doesnot belong to you",
+    });
+  }
+
+  return res.status(200).json({
+    success: true,
+    data: order,
+    error: null,
+  });
+});
+
+app.get("/orders", auth, async (req, res) => {
+  const userId = req.user!.id;
+  const orders = await prisma.order.findMany({
+    where: {
+      userId,
+    },
+  });
+  res.status(200).json({
+    success: true,
+    error: null,
+    data: orders,
+  });
+});
 
 app.post("/signup", async (req, res) => {
   const validated = signupSchema.safeParse(req.body);
@@ -478,6 +610,9 @@ app.post("/order", auth, async (req, res) => {
 
       const totalSellFills = totalSellQuantity - qtyToBeSold;
 
+      //    returns the status of an order (partially filled, success, cancellled)
+      //      ALSO RETURNS THE INDIVIDUAL FILLS OF THIS ORDER
+
       res.status(200).json({
         success: true,
         error: null,
@@ -685,6 +820,7 @@ app.post("/order", auth, async (req, res) => {
       let askQtyLeft = totalSellQuantity;
       const askPrice = price;
       let filled = 0;
+      const fillsArray: Fills[] = [];
 
       if (!BALANCES[userId]![symbol]) {
         BALANCES[userId]![symbol] = { locked: 0, total: 0 };
@@ -896,7 +1032,7 @@ async function createLimitOrderAndUpdateOrderBook(
   });
 
   if (filled > 0) {
-    await prisma.fills.create({
+    const fills = await prisma.fills.create({
       data: {
         qty: filled,
         side,
@@ -929,5 +1065,4 @@ async function createLimitOrderAndUpdateOrderBook(
   });
   return order;
 }
-
 app.listen(3000, () => console.log(`Backend started on PORT:3000`));
