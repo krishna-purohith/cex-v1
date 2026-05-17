@@ -5,7 +5,6 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { JWT_SECRET } from "./config";
 import { auth } from "./auth";
-import { readBuilderProgram } from "typescript";
 import { success } from "zod";
 
 const app = express();
@@ -647,6 +646,7 @@ app.post("/order", auth, async (req, res) => {
             orders.splice(i, 1);
             i--;
           }
+          if (bidQtyLeft === 0) break;
         }
 
         if (ORDER_BOOKS[symbol].ASKS[askPrice]!.totalQty === 0) {
@@ -681,6 +681,195 @@ app.post("/order", auth, async (req, res) => {
         },
       });
     } else if (side === "SELL") {
+      const totalSellQuantity = totalQuantity;
+      let askQtyLeft = totalSellQuantity;
+      const askPrice = price;
+      let filled = 0;
+
+      if (!BALANCES[userId]![symbol]) {
+        BALANCES[userId]![symbol] = { locked: 0, total: 0 };
+        return res.status(400).json({
+          success: false,
+          error: `You have no ${symbol} to make the trade`,
+          data: null,
+        });
+      }
+
+      const assetBalance =
+        BALANCES[userId]![symbol].total - BALANCES[userId]![symbol].locked;
+      if (assetBalance < totalSellQuantity) {
+        return res.status(400).json({
+          success: false,
+          error: `You have no sufficient ${symbol}  quantity to make the trade`,
+          data: null,
+        });
+      }
+
+      BALANCES[userId]![symbol].locked += totalSellQuantity;
+
+      if (!ORDER_BOOKS[symbol]) {
+        const order = await createLimitOrderAndUpdateOrderBook(
+          askPrice,
+          userId,
+          totalSellQuantity,
+          0,
+          symbol,
+          "SELL"
+        );
+        return res.status(200).json({
+          success: true,
+          error: null,
+          data: {
+            message: "Limit Sell order placed.",
+            totalFilled: 0,
+            order,
+            price: price,
+          },
+        });
+      }
+
+      const priceStrings = Object.keys(ORDER_BOOKS[symbol].BIDS);
+      const prices = priceStrings.map((p) => Number(p));
+      const sortedPrices = prices.sort((a, b) => b - a);
+      // min price at which I want to sell is the askPrice.
+      // now maximum Bidder will get the first preference to match the order.
+
+      for (const bidPrice of sortedPrices) {
+        // fulfillBids where bidPrice is >= askPrice
+        if (bidPrice < askPrice) {
+          // place the remaining qty on the ASKS
+          const order = await createLimitOrderAndUpdateOrderBook(
+            askPrice,
+            userId,
+            totalSellQuantity,
+            filled,
+            symbol,
+            "SELL"
+          );
+          return res.status(200).json({
+            success: true,
+            error: null,
+            data: {
+              message: "Limit order placed succesfully.",
+              totalFilled: filled,
+              position: {
+                quantity: totalSellQuantity - filled,
+                orderId: order.id,
+                createdAt: order.createdAt,
+              },
+            },
+          });
+        }
+
+        const availableAtThisBidPrice =
+          ORDER_BOOKS[symbol].BIDS[bidPrice]!.totalQty;
+
+        const filledAtThisBidPrice = Math.min(
+          askQtyLeft,
+          availableAtThisBidPrice
+        );
+
+        if (filledAtThisBidPrice === 0) break;
+
+        await prisma.order.create({
+          data: {
+            userId,
+            market: symbol,
+            price: askPrice,
+            qty: totalSellQuantity,
+            type: "LIMIT",
+            side: "SELL",
+            filledQty: filledAtThisBidPrice,
+            status: "FILLED",
+          },
+        });
+
+        askQtyLeft -= filledAtThisBidPrice;
+        filled += filledAtThisBidPrice;
+
+        BALANCES[userId]![symbol].locked -= filledAtThisBidPrice;
+        BALANCES[userId]![symbol].total -= filledAtThisBidPrice;
+
+        if (!BALANCES[userId]!["USD"]) {
+          BALANCES[userId]!["USD"] = {
+            locked: 0,
+            total: filledAtThisBidPrice * bidPrice,
+          };
+        } else {
+          BALANCES[userId]!["USD"].total += filledAtThisBidPrice * bidPrice;
+        }
+
+        // Bidders side ------------------------------------------------------------------------------------------------------
+
+        // get all the Bids for this asset at this price
+        const orders = ORDER_BOOKS[symbol].BIDS[bidPrice]!.orders; // check the exclamation at this bidPrice case.
+        ORDER_BOOKS[symbol].BIDS[bidPrice]!.totalQty -= filledAtThisBidPrice;
+
+        let toBeFilledAtThisPrice = filledAtThisBidPrice;
+
+        for (let i = 0; i < orders.length; i++) {
+          // then -> fulfillBIds at each price, update their balances,
+          const order = orders[i];
+          if (!order) continue;
+          const pending = order.qty - order.filledQty;
+          const filledFromThisOrder = Math.min(pending, toBeFilledAtThisPrice);
+
+          toBeFilledAtThisPrice -= filledFromThisOrder;
+
+          order.filledQty += filledFromThisOrder;
+
+          if (!BALANCES[order.userId]![symbol]) {
+            BALANCES[order.userId]![symbol] = {
+              locked: 0,
+              total: filledFromThisOrder,
+            };
+          } else {
+            BALANCES[order.userId]![symbol]!.total += filledFromThisOrder;
+          }
+
+          BALANCES[order.userId]!["USD"]!.locked -=
+            bidPrice * filledFromThisOrder;
+          BALANCES[order.userId]!["USD"]!.total -=
+            filledFromThisOrder * bidPrice;
+
+          if (order.filledQty === order.qty) {
+            ORDER_BOOKS[symbol].BIDS[bidPrice]!.orders.splice(i, 1);
+            i--;
+          }
+
+          if (toBeFilledAtThisPrice === 0) {
+            break;
+          }
+        }
+
+        if (ORDER_BOOKS[symbol].BIDS[bidPrice]!.totalQty === 0) {
+          delete ORDER_BOOKS[symbol].BIDS[bidPrice];
+        }
+
+        if (askQtyLeft === 0) break;
+        if (filled === totalSellQuantity) break;
+      }
+
+      if (askQtyLeft > 0) {
+        await createLimitOrderAndUpdateOrderBook(
+          askPrice,
+          userId,
+          totalSellQuantity,
+          filled,
+          symbol,
+          "SELL"
+        );
+      }
+      res.status(200).json({
+        success: true,
+        error: null,
+        data: {
+          message:
+            askQtyLeft === 0 ? `Order fully filled` : `Order filled Partially`,
+          totalFilled: filled,
+          reamainingQty: askQtyLeft,
+        },
+      });
     }
   }
 });
