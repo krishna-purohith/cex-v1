@@ -5,7 +5,7 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { JWT_SECRET } from "./config";
 import { auth } from "./auth";
-import { success } from "zod";
+import { success, symbol } from "zod";
 import { Fills } from "./generated/prisma/client";
 
 const app = express();
@@ -38,8 +38,47 @@ type OrderBook = Record<
 
 const ORDER_BOOKS: OrderBook = {};
 
-app.get("/depth/:symbol", auth, (req, res) => {});
-
+app.get("/depth/:symbol", (req, res) => {
+  const symbol = req.params.symbol;
+  if (typeof symbol !== "string") {
+    return res.status(400).json({
+      error: "symbol should be string",
+      data: null,
+      success: false,
+    });
+  }
+  const depth = ORDER_BOOKS[symbol];
+  if (!depth) {
+    return res.status(404).json({
+      success: false,
+      error: "No order book found for this symbol",
+      data: null,
+    });
+  }
+  res.status(200).json({
+    error: null,
+    success: true,
+    data: depth,
+  });
+});
+app.get("/balance", auth, (req, res) => {
+  const userId = req.user!.id;
+  const balances = BALANCES[userId];
+  if (!balances) {
+    return res.status(404).json({
+      success: false,
+      error: "Balances not found",
+      data: null,
+    });
+  }
+  res.status(200).json({
+    success: true,
+    error: null,
+    data: {
+      balances,
+    },
+  });
+});
 app.delete("/order/:orderId", auth, async (req, res) => {
   const id = req.params.orderId;
   if (typeof id !== "string") {
@@ -75,34 +114,51 @@ app.delete("/order/:orderId", auth, async (req, res) => {
       });
     }
 
-    if (order.type === "MARKET") {
-      return res.status(200).json({
+    if (order.type !== "LIMIT") {
+      return res.status(400).json({
         success: false,
         data: null,
         error: "You should have a limit order, ",
       });
     }
 
+    if (order.status !== "OPEN") {
+      return res.status(400).json({
+        success: false,
+        data: null,
+        error: "Only open orders can be cancelled ",
+      });
+    }
+
     const side = order.side === "BUY" ? "BIDS" : "ASKS";
 
-    const priceLevel = ORDER_BOOKS[order.market]?[side][order.price]
-    
+    const priceLevel = ORDER_BOOKS[order.market]?.[side]?.[order.price];
 
     const reamainingQty = order.qty - order.filledQty;
+
+    if (priceLevel) {
+      priceLevel.totalQty -= reamainingQty;
+      priceLevel.orders = priceLevel.orders.filter(
+        (o) => o.orderId !== order.id
+      );
+
+      if (priceLevel.totalQty === 0) {
+        delete ORDER_BOOKS[order.market]![side][order.price];
+      }
+    }
+
     if (order.side === "BUY") {
       BALANCES[order.userId]!["USD"]!.locked -= order.price * reamainingQty;
     } else {
       BALANCES[order.userId]![order.market]!.locked -= reamainingQty;
     }
 
-    if (order.status === "OPEN") {
-      await prisma.order.update({
-        where: { id },
-        data: {
-          status: "CANCELLED",
-        },
-      });
-    }
+    await prisma.order.update({
+      where: { id },
+      data: {
+        status: "CANCELLED",
+      },
+    });
 
     return res.status(200).json({
       success: true,
@@ -119,6 +175,44 @@ app.delete("/order/:orderId", auth, async (req, res) => {
   }
 });
 
+app.get("/fills", auth, async (req, res) => {
+  const userId = req.user!.id;
+  const fills = await prisma.fills.findMany({
+    where: { userId },
+  });
+  res.status(200).json({
+    success: true,
+    error: null,
+    data: fills,
+  });
+});
+app.get("/balance/usd", auth, async (req, res) => {
+  if (!BALANCES[req.user!.id]) {
+    return res.status(400).json({
+      error: "Balance not found",
+      data: null,
+      success: false,
+    });
+  }
+  if (!BALANCES[req.user!.id]!["USD"]) {
+    return res.status(400).json({
+      error: "You donot have USD wallet enabled",
+      data: null,
+      success: false,
+    });
+  }
+  const usdTotal = BALANCES[req.user!.id]!["USD"]!.total;
+  const usdLocked = BALANCES[req.user!.id]!["USD"]!.locked;
+  res.status(200).json({
+    success: true,
+    error: null,
+    data: {
+      total: usdTotal,
+      locked: usdLocked,
+      available: usdTotal - usdLocked,
+    },
+  });
+});
 app.get("/order/:orderId", auth, async (req, res) => {
   const id = req.params.orderId;
   if (typeof id !== "string") {
